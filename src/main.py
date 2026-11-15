@@ -3,7 +3,7 @@ import logging
 from os import getenv
 from datetime import date, timedelta
 from ipaddress import ip_address
-from math import atan, ceil, degrees, log, pi, radians, sin, sinh, tan
+from math import atan, ceil, degrees, isfinite, log, pi, radians, sin, sinh, tan
 from statistics import mean
 from urllib.parse import urlsplit
 
@@ -22,6 +22,11 @@ from uuid import uuid4
 MAP_START = (15, 0)
 MAP_START_ZOOM = 2
 PARCEL_ZOOM = 15
+
+
+def location_zoom(accuracy):
+    """Keep the device's uncertainty visible at the starting zoom."""
+    return max(2, min(16, int(log(10_000_000 / max(1, accuracy), 2))))
 
 
 def browser_url(url):
@@ -116,8 +121,9 @@ async def main(page: ft.Page):
                                         (event.coordinates.longitude + 180) % 360 - 180)
         if drawing:
             if (last_camera.zoom if last_camera else globe.initial_zoom) < PARCEL_ZOOM:
-                draw_hint.value = "Acerca el mapa hasta ver los límites de la parcela."
+                draw_hint.value = "Acercando la zona. Marca el primer vértice cuando veas los límites."
                 page.update()
+                await focus_map(point, 16)
                 return
             if selected_vertex is None:
                 if vertices and point == vertices[-1]:
@@ -274,11 +280,11 @@ async def main(page: ft.Page):
             location_button.tooltip = "Mi ubicación"
             page.update()
         if revision == position_revision:
-            if (position.accuracy is None or not 0 < position.accuracy <= 100
+            if (position.accuracy is None or not isfinite(position.accuracy) or position.accuracy < 0
                     or not -85 <= position.latitude <= 85
                     or not -180 <= position.longitude <= 180):
                 show_map()
-                notify("El dispositivo no dio una ubicación precisa. Busca tu zona o marca la parcela.",
+                notify("El dispositivo no entregó coordenadas válidas. Intenta de nuevo o busca tu zona.",
                        "#775019", dismiss=False)
                 return
             point = fm.MapLatitudeLongitude(position.latitude, position.longitude)
@@ -291,9 +297,12 @@ async def main(page: ft.Page):
                                border_color="#FFFFFF", border_stroke_width=2)]
             analyze_location.visible = True
             show_map()
-            notify(f"Ubicación del dispositivo · precisión ±{position.accuracy:.0f} m. "
-                   "Confirma que el punto azul está en tu zona.", "#146247", dismiss=False)
-            await focus_map(point, 16)
+            approximate = position.accuracy > 100
+            source = "Ubicación aproximada" if approximate else "Ubicación del dispositivo"
+            notify(f"{source} · margen ±{position.accuracy:.0f} m. "
+                   "Confirma el punto azul o toca tu parcela en el mapa.",
+                   "#775019" if approximate else "#146247", dismiss=False)
+            await focus_map(point, location_zoom(position.accuracy))
 
     async def focus_map(point, zoom):
         try:
@@ -304,7 +313,9 @@ async def main(page: ft.Page):
     async def confirm_location(_):
         if gps_position and not locating:
             point, accuracy = gps_position
-            await select(point.latitude, point.longitude, f"GPS confirmado · precisión ±{accuracy:.0f} m")
+            label = "Ubicación aproximada" if accuracy > 100 else "Ubicación confirmada"
+            await select(point.latitude, point.longitude, f"{label} · margen ±{accuracy:.0f} m",
+                         zoom=location_zoom(accuracy))
 
     async def manual(_):
         try:
@@ -315,7 +326,7 @@ async def main(page: ft.Page):
             return
         await select(latitude, longitude)
 
-    async def select(latitude, longitude, name="Parcela seleccionada"):
+    async def select(latitude, longitude, name="Parcela seleccionada", *, zoom=None):
         nonlocal version, position_revision, scene_request, climate_job, scene_job, selection_key, provider_focus
         if drawing:
             notify("Cierra o cancela el dibujo antes de cambiar de lugar.", "#775019")
@@ -358,8 +369,8 @@ async def main(page: ft.Page):
         page.update()
         async def focus():
             try:
-                zoom = 16 if name.startswith("GPS") else 13 if name != "Parcela seleccionada" else None
-                await focus_map(point, zoom)
+                target_zoom = zoom if zoom is not None else 13 if name != "Parcela seleccionada" else None
+                await focus_map(point, target_zoom)
             except Exception:
                 pass
 
@@ -631,12 +642,12 @@ async def main(page: ft.Page):
         show_map()
         update_boundary()
         center = saved_vertices[0] if saved_vertices else provider_focus
-        if center is None and gps_position:
+        if center is None and gps_position and gps_position[1] <= 100:
             center = gps_position[0]
         if center is not None:
             await focus_map(center, 16)
         elif (last_camera.zoom if last_camera else globe.initial_zoom) < PARCEL_ZOOM:
-            draw_hint.value = "Acerca el mapa hasta ver los límites de la parcela y marca 3 vértices."
+            draw_hint.value = "Toca la zona para acercarte. Luego marca al menos tres vértices."
             page.update()
 
     def undo(_):
