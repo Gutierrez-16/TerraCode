@@ -22,11 +22,21 @@ from uuid import uuid4
 MAP_START = (15, 0)
 MAP_START_ZOOM = 2
 PARCEL_ZOOM = 15
+LOCATION_TIMEOUT = 10
+PARCEL_LOCATION_ACCURACY = 100
 
 
 def location_zoom(accuracy):
     """Keep the device's uncertainty visible at the starting zoom."""
     return max(2, min(16, int(log(10_000_000 / max(1, accuracy), 2))))
+
+
+def valid_position(position):
+    return (position is not None
+            and position.latitude is not None and -85 <= position.latitude <= 85
+            and position.longitude is not None and -180 <= position.longitude <= 180
+            and position.accuracy is not None and isfinite(position.accuracy)
+            and position.accuracy >= 0 and not position.mocked)
 
 
 def browser_url(url):
@@ -256,13 +266,15 @@ async def main(page: ft.Page):
                 await asyncio.wait_for(geo.request_permission(), timeout=12)
             configuration = gps.GeolocatorWebConfiguration(
                 accuracy=gps.GeolocatorPositionAccuracy.HIGH,
-                time_limit=ft.Duration(seconds=20), maximum_age=ft.Duration(seconds=0),
+                time_limit=ft.Duration(seconds=LOCATION_TIMEOUT), maximum_age=ft.Duration(seconds=0),
             ) if page.web else None
-            position = await asyncio.wait_for(geo.get_current_position(configuration), timeout=23)
+            timeout = LOCATION_TIMEOUT + 1 if page.web else 23
+            position = await asyncio.wait_for(geo.get_current_position(configuration), timeout=timeout)
         except TimeoutError:
             if revision == position_revision:
                 show_map()
-                notify("La ubicación tardó demasiado. Activa el GPS o marca la parcela.", "#775019")
+                notify("El navegador no entregó una ubicación a tiempo. Reintenta o usa Buscar.",
+                       "#775019", dismiss=False)
             return
         except Exception as error:
             logging.getLogger(__name__).warning("Geolocalización: %s", error)
@@ -270,9 +282,12 @@ async def main(page: ft.Page):
                 show_map()
                 reason = str(error).lower()
                 if "denied" in reason or "permission" in reason:
-                    notify("Permite la ubicación en el navegador y el dispositivo.", "#775019")
+                    message = "Permite la ubicación en el navegador y en el dispositivo, y reintenta."
+                elif "timeout" in reason or "timed out" in reason:
+                    message = "El navegador no entregó una ubicación a tiempo. Reintenta o usa Buscar."
                 else:
-                    notify("Ubicación no disponible. Activa el GPS o marca la parcela.", "#775019")
+                    message = "El navegador no pudo obtener tu ubicación. Reintenta o usa Buscar."
+                notify(message, "#775019", dismiss=False)
             return
         finally:
             locating = False
@@ -280,27 +295,30 @@ async def main(page: ft.Page):
             location_button.tooltip = "Mi ubicación"
             page.update()
         if revision == position_revision:
-            if (position.accuracy is None or not isfinite(position.accuracy) or position.accuracy < 0
-                    or not -85 <= position.latitude <= 85
-                    or not -180 <= position.longitude <= 180):
+            if not valid_position(position):
                 show_map()
                 notify("El dispositivo no entregó coordenadas válidas. Intenta de nuevo o busca tu zona.",
                        "#775019", dismiss=False)
                 return
             point = fm.MapLatitudeLongitude(position.latitude, position.longitude)
-            gps_position = (point, position.accuracy)
+            approximate = position.accuracy > PARCEL_LOCATION_ACCURACY
             gps_accuracy.circles = [fm.CircleMarker(
                 radius=max(1, position.accuracy), use_radius_in_meter=True,
                 coordinates=point,
                 color="#334D9DF0", border_color="#4D9DF0", border_stroke_width=2,
-            ), fm.CircleMarker(radius=5, coordinates=point, color="#1767A8",
-                               border_color="#FFFFFF", border_stroke_width=2)]
-            analyze_location.visible = True
+            )]
+            if not approximate:
+                gps_position = (point, position.accuracy)
+                gps_accuracy.circles.append(fm.CircleMarker(
+                    radius=5, coordinates=point, color="#1767A8",
+                    border_color="#FFFFFF", border_stroke_width=2,
+                ))
+                analyze_location.visible = True
             show_map()
-            approximate = position.accuracy > 100
-            source = "Ubicación aproximada" if approximate else "Ubicación del dispositivo"
-            notify(f"{source} · margen ±{position.accuracy:.0f} m. "
-                   "Confirma el punto azul o toca tu parcela en el mapa.",
+            source = "Área aproximada del navegador" if approximate else "Ubicación del dispositivo"
+            guidance = ("Usa Buscar para ir a tu localidad y marca la parcela en el mapa."
+                        if approximate else "Confirma el punto azul o selecciona tu parcela.")
+            notify(f"{source} · margen ±{position.accuracy:.0f} m. {guidance}",
                    "#775019" if approximate else "#146247", dismiss=False)
             await focus_map(point, location_zoom(position.accuracy))
 
@@ -313,8 +331,7 @@ async def main(page: ft.Page):
     async def confirm_location(_):
         if gps_position and not locating:
             point, accuracy = gps_position
-            label = "Ubicación aproximada" if accuracy > 100 else "Ubicación confirmada"
-            await select(point.latitude, point.longitude, f"{label} · margen ±{accuracy:.0f} m",
+            await select(point.latitude, point.longitude, f"Ubicación confirmada · margen ±{accuracy:.0f} m",
                          zoom=location_zoom(accuracy))
 
     async def manual(_):
@@ -642,7 +659,7 @@ async def main(page: ft.Page):
         show_map()
         update_boundary()
         center = saved_vertices[0] if saved_vertices else provider_focus
-        if center is None and gps_position and gps_position[1] <= 100:
+        if center is None and gps_position:
             center = gps_position[0]
         if center is not None:
             await focus_map(center, 16)
@@ -864,7 +881,6 @@ async def main(page: ft.Page):
         if page.web:
             width = page.width or 800
             header_view.height = 138 if width <= 510 else 112 if width <= 680 else 73
-            root.height = max(420, (page.height or 800) - header_view.height)
         drawer.height = min(500, (page.height or 700) * .57) if compact else None
         toast.width = min(300, max(140, (page.width or 800) - 24))
         if compact != compact_layout:
@@ -1027,10 +1043,7 @@ async def main(page: ft.Page):
     landing = fwv.WebView(url=project_url, expand=True, visible=False) if page.web else None
     if page.web:
         header_view = fwv.WebView(url=f"{chrome_url}?vista=header&pagina=mapa", height=73)
-        footer_view = fwv.WebView(url=f"{chrome_url}?vista=footer", height=300)
-        root.expand = False
-        map_page = ft.Column([root, footer_view], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
-        page.add(header_view, map_page, landing)
+        page.add(header_view, root, landing)
     else:
         page.add(toolbar, root)
     page.on_resize = resize
@@ -1059,7 +1072,7 @@ async def main(page: ft.Page):
             path = urlsplit(route or "").path.rstrip("/")
             show_landing = path not in {"/mapa", "/globo"} and not page.query.to_dict.get("punto")
             landing.visible = show_landing
-            header_view.visible = map_page.visible = not show_landing
+            header_view.visible = root.visible = not show_landing
             section = page.query.to_dict.get("seccion")
             if show_landing and section in {"video", "proyecto", "equipo"}:
                 landing.url = f"{project_url}#{section}"
