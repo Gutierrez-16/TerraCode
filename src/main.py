@@ -3,7 +3,7 @@ import logging
 from os import getenv
 from datetime import date, timedelta
 from ipaddress import ip_address
-from math import atan, ceil, degrees, log, pi, radians, sin, sinh, tan
+from math import atan, ceil, degrees, isfinite, log, pi, radians, sin, sinh, tan
 from statistics import mean
 from urllib.parse import urlsplit
 
@@ -21,6 +21,22 @@ from uuid import uuid4
 
 MAP_START = (15, 0)
 MAP_START_ZOOM = 2
+PARCEL_ZOOM = 15
+LOCATION_TIMEOUT = 10
+PARCEL_LOCATION_ACCURACY = 100
+
+
+def location_zoom(accuracy):
+    """Keep the device's uncertainty visible at the starting zoom."""
+    return max(2, min(16, int(log(10_000_000 / max(1, accuracy), 2))))
+
+
+def valid_position(position):
+    return (position is not None
+            and position.latitude is not None and -85 <= position.latitude <= 85
+            and position.longitude is not None and -180 <= position.longitude <= 180
+            and position.accuracy is not None and isfinite(position.accuracy)
+            and position.accuracy >= 0 and not position.mocked)
 
 
 def browser_url(url):
@@ -97,6 +113,7 @@ async def main(page: ft.Page):
     version = 0
     position_revision = 0
     locating = False
+    gps_position = None
     drawing = False
     vertices = []
     saved_vertices = []
@@ -108,9 +125,16 @@ async def main(page: ft.Page):
 
     async def choose(event):
         nonlocal selected_vertex
+        if locating:
+            return
         point = fm.MapLatitudeLongitude(event.coordinates.latitude,
                                         (event.coordinates.longitude + 180) % 360 - 180)
         if drawing:
+            if (last_camera.zoom if last_camera else globe.initial_zoom) < PARCEL_ZOOM:
+                draw_hint.value = "Acercando la zona. Marca el primer vértice cuando veas los límites."
+                page.update()
+                await focus_map(point, 16)
+                return
             if selected_vertex is None:
                 if vertices and point == vertices[-1]:
                     return
@@ -220,7 +244,7 @@ async def main(page: ft.Page):
         if drawing:
             notify("Cierra o cancela el dibujo antes de cambiar de lugar.", "#775019")
             return
-        nonlocal position_revision, locating
+        nonlocal position_revision, locating, gps_position
         if locating:
             return
         if page.web and not web_location_allowed(page.url):
@@ -228,6 +252,9 @@ async def main(page: ft.Page):
             notify("Activa HTTPS para usar el GPS o marca la parcela en el mapa.", "#775019")
             return
         locating = True
+        gps_position = None
+        gps_accuracy.circles = []
+        analyze_location.visible = False
         position_revision += 1
         revision = position_revision
         location_button.disabled = True
@@ -239,13 +266,15 @@ async def main(page: ft.Page):
                 await asyncio.wait_for(geo.request_permission(), timeout=12)
             configuration = gps.GeolocatorWebConfiguration(
                 accuracy=gps.GeolocatorPositionAccuracy.HIGH,
-                time_limit=ft.Duration(seconds=20), maximum_age=ft.Duration(seconds=0),
+                time_limit=ft.Duration(seconds=LOCATION_TIMEOUT), maximum_age=ft.Duration(seconds=0),
             ) if page.web else None
-            position = await asyncio.wait_for(geo.get_current_position(configuration), timeout=23)
+            timeout = LOCATION_TIMEOUT + 1 if page.web else 23
+            position = await asyncio.wait_for(geo.get_current_position(configuration), timeout=timeout)
         except TimeoutError:
             if revision == position_revision:
                 show_map()
-                notify("La ubicación tardó demasiado. Activa el GPS o marca la parcela.", "#775019")
+                notify("El navegador no entregó una ubicación a tiempo. Reintenta o usa Buscar.",
+                       "#775019", dismiss=False)
             return
         except Exception as error:
             logging.getLogger(__name__).warning("Geolocalización: %s", error)
@@ -253,9 +282,12 @@ async def main(page: ft.Page):
                 show_map()
                 reason = str(error).lower()
                 if "denied" in reason or "permission" in reason:
-                    notify("Permite la ubicación en el navegador y el dispositivo.", "#775019")
+                    message = "Permite la ubicación en el navegador y en el dispositivo, y reintenta."
+                elif "timeout" in reason or "timed out" in reason:
+                    message = "El navegador no entregó una ubicación a tiempo. Reintenta o usa Buscar."
                 else:
-                    notify("Ubicación no disponible. Activa el GPS o marca la parcela.", "#775019")
+                    message = "El navegador no pudo obtener tu ubicación. Reintenta o usa Buscar."
+                notify(message, "#775019", dismiss=False)
             return
         finally:
             locating = False
@@ -263,18 +295,44 @@ async def main(page: ft.Page):
             location_button.tooltip = "Mi ubicación"
             page.update()
         if revision == position_revision:
-            if position.accuracy is None or not 0 < position.accuracy <= 100:
+            if not valid_position(position):
                 show_map()
-                notify("La ubicación es imprecisa. Busca tu zona o selecciona la parcela.", "#775019")
+                notify("El dispositivo no entregó coordenadas válidas. Intenta de nuevo o busca tu zona.",
+                       "#775019", dismiss=False)
                 return
-            label = f"GPS · precisión ±{position.accuracy:.0f} m"
-            notify("Ubicación recibida. Cargando datos de la zona.", "#146247")
+            point = fm.MapLatitudeLongitude(position.latitude, position.longitude)
+            approximate = position.accuracy > PARCEL_LOCATION_ACCURACY
             gps_accuracy.circles = [fm.CircleMarker(
                 radius=max(1, position.accuracy), use_radius_in_meter=True,
-                coordinates=fm.MapLatitudeLongitude(position.latitude, position.longitude),
+                coordinates=point,
                 color="#334D9DF0", border_color="#4D9DF0", border_stroke_width=2,
             )]
-            await select(position.latitude, position.longitude, label)
+            if not approximate:
+                gps_position = (point, position.accuracy)
+                gps_accuracy.circles.append(fm.CircleMarker(
+                    radius=5, coordinates=point, color="#1767A8",
+                    border_color="#FFFFFF", border_stroke_width=2,
+                ))
+                analyze_location.visible = True
+            show_map()
+            source = "Área aproximada del navegador" if approximate else "Ubicación del dispositivo"
+            guidance = ("Usa Buscar para ir a tu localidad y marca la parcela en el mapa."
+                        if approximate else "Confirma el punto azul o selecciona tu parcela.")
+            notify(f"{source} · margen ±{position.accuracy:.0f} m. {guidance}",
+                   "#775019" if approximate else "#146247", dismiss=False)
+            await focus_map(point, location_zoom(position.accuracy))
+
+    async def focus_map(point, zoom):
+        try:
+            await asyncio.wait_for(globe.move_to(point, zoom=zoom), timeout=3)
+        except TimeoutError:
+            logging.getLogger(__name__).debug("El mapa no confirmó el cambio de cámara")
+
+    async def confirm_location(_):
+        if gps_position and not locating:
+            point, accuracy = gps_position
+            await select(point.latitude, point.longitude, f"Ubicación confirmada · margen ±{accuracy:.0f} m",
+                         zoom=location_zoom(accuracy))
 
     async def manual(_):
         try:
@@ -285,7 +343,7 @@ async def main(page: ft.Page):
             return
         await select(latitude, longitude)
 
-    async def select(latitude, longitude, name="Parcela seleccionada"):
+    async def select(latitude, longitude, name="Parcela seleccionada", *, zoom=None):
         nonlocal version, position_revision, scene_request, climate_job, scene_job, selection_key, provider_focus
         if drawing:
             notify("Cierra o cancela el dibujo antes de cambiar de lugar.", "#775019")
@@ -319,9 +377,8 @@ async def main(page: ft.Page):
         highlight_tab("Clima")
         lat.value, lon.value = f"{latitude:.5f}", f"{longitude:.5f}"
         coords.value = f"{name} · {lat.value}, {lon.value}"
-        if not name.startswith("GPS"):
-            gps_accuracy.circles = []
-            toast.visible = False
+        analyze_location.visible = False
+        toast.visible = False
         status.value = ""
         marker.markers = [fm.Marker(coordinates=point, content=ft.Icon(ft.Icons.LOCATION_ON, color="#D55334", size=36))]
         climate.controls = [ft.ProgressBar(), ft.Text("Consultando NASA POWER…")]
@@ -329,8 +386,8 @@ async def main(page: ft.Page):
         page.update()
         async def focus():
             try:
-                zoom = 16 if name.startswith("GPS") else 13 if name != "Parcela seleccionada" else None
-                await asyncio.wait_for(globe.move_to(point, zoom=zoom), timeout=3)
+                target_zoom = zoom if zoom is not None else 13 if name != "Parcela seleccionada" else None
+                await focus_map(point, target_zoom)
             except Exception:
                 pass
 
@@ -570,6 +627,10 @@ async def main(page: ft.Page):
                 content=ft.Text(str(i), size=12, color="#FFFFFF"),
             )) for i, point in enumerate(vertices, 1)
         ]
+        if drawing:
+            boundary.polygons = []
+            if len(vertices) >= 3:
+                show_boundary(vertices)
         parcel_status.value = f"{len(vertices)} vértices. Toca el mapa para añadir otro." if drawing else "Dibuja el perímetro tocando el mapa."
         draw_hint.value = (
             f"Toca la nueva posición del vértice {selected_vertex + 1}."
@@ -578,13 +639,17 @@ async def main(page: ft.Page):
         )
         page.update()
 
-    def draw_parcel(_):
+    async def draw_parcel(_):
         nonlocal drawing, selected_vertex, position_revision
         if drawing:
+            return
+        if locating:
             return
         position_revision += 1
         toast.visible = False
         drawing = True
+        analyze_location.visible = False
+        location_button.disabled = True
         selected_vertex = None
         draw_tools.visible = True
         vertices[:] = saved_vertices
@@ -593,6 +658,14 @@ async def main(page: ft.Page):
         reopen_analysis.visible = False
         show_map()
         update_boundary()
+        center = saved_vertices[0] if saved_vertices else provider_focus
+        if center is None and gps_position:
+            center = gps_position[0]
+        if center is not None:
+            await focus_map(center, 16)
+        elif (last_camera.zoom if last_camera else globe.initial_zoom) < PARCEL_ZOOM:
+            draw_hint.value = "Toca la zona para acercarte. Luego marca al menos tres vértices."
+            page.update()
 
     def undo(_):
         nonlocal selected_vertex
@@ -604,10 +677,13 @@ async def main(page: ft.Page):
     def cancel_draw(_):
         nonlocal drawing, selected_vertex
         drawing = False
+        location_button.disabled = False
+        analyze_location.visible = gps_position is not None
         selected_vertex = None
         draw_tools.visible = False
         vertices.clear()
         handles.markers = []
+        boundary.polygons = []
         if saved_vertices:
             show_boundary(saved_vertices)
         drawer.visible = True
@@ -636,6 +712,7 @@ async def main(page: ft.Page):
             page.update()
             return
         drawing = False
+        location_button.disabled = False
         selected_vertex = None
         draw_tools.visible = False
         outline.polylines = []
@@ -676,6 +753,8 @@ async def main(page: ft.Page):
         style=ft.ButtonStyle(bgcolor="#E8F6FF", color="#123250"),
         visible=not use_3d,
     )
+    analyze_location = button("Analizar ubicación", confirm_location)
+    analyze_location.visible = False
     async def select_from_globe(latitude, longitude):
         await select(latitude, longitude, "Punto seleccionado en el globo")
 
@@ -762,8 +841,8 @@ async def main(page: ft.Page):
                               alignment=ft.Alignment.CENTER_LEFT, content=ft.Container(
                                   bgcolor="#18382D", padding=7, border_radius=8, content=attribution,
                               ))
-    draw_tools.left, draw_tools.right, draw_tools.bottom = 8, 8, 88
-    draw_tools.padding, draw_tools.bgcolor, draw_tools.border_radius = 8, "#FFFFFF", 10
+    draw_tools.left, draw_tools.bottom = 12, 88
+    draw_tools.padding, draw_tools.bgcolor, draw_tools.border_radius = 12, "#FFFFFF", 12
     finish_button = button("Guardar contorno", finish_parcel)
     undo_button = ft.IconButton(ft.Icons.UNDO, tooltip="Quitar último vértice", on_click=undo)
     draw_tools.content = ft.Column([ft.Text("Dibujar parcela", weight=ft.FontWeight.BOLD), draw_hint, ft.Row([
@@ -778,7 +857,9 @@ async def main(page: ft.Page):
         welcome_layer, map_area,
         map_credit,
         draw_tools,
-        ft.Container(right=22, bottom=38, content=location_button),
+        ft.Container(right=12, bottom=42, content=ft.Row(
+            [analyze_location, location_button], spacing=6, tight=True,
+        )),
         toast,
     ], expand=True)
     globe_switch = ft.Container(
@@ -795,11 +876,11 @@ async def main(page: ft.Page):
         if not provider_started:
             globe.initial_zoom = max(MAP_START_ZOOM, ceil(log(max(256, page.width or 800) / 256, 2)))
         compact = bool(page.width and page.width < 760)
+        draw_tools.width = min(390, max(200, (page.width or 800) - 24))
         drawer.width = None if compact else min(460, max(330, (page.width or 1100) * .35))
         if page.web:
             width = page.width or 800
             header_view.height = 138 if width <= 510 else 112 if width <= 680 else 73
-            root.height = max(420, (page.height or 800) - header_view.height)
         drawer.height = min(500, (page.height or 700) * .57) if compact else None
         toast.width = min(300, max(140, (page.width or 800) - 24))
         if compact != compact_layout:
@@ -924,8 +1005,8 @@ async def main(page: ft.Page):
         page.show_dialog(search_dialog)
 
     map_stack.controls.insert(-1, ft.Container(right=14, top=14, content=ft.Row([
-        ft.IconButton(ft.Icons.EDIT_LOCATION_ALT_OUTLINED, tooltip="Dibujar parcela",
-                      bgcolor="#E8F6FF", icon_color="#123250", on_click=draw_parcel),
+        ft.Button("Dibujar", icon=ft.Icons.EDIT_LOCATION_ALT_OUTLINED, on_click=draw_parcel,
+                  style=ft.ButtonStyle(bgcolor="#E8F6FF", color="#123250")),
         ft.Button("Buscar", icon=ft.Icons.SEARCH, on_click=open_search,
                   style=ft.ButtonStyle(bgcolor="#E8F6FF", color="#123250")),
     ], spacing=6)))
@@ -962,10 +1043,7 @@ async def main(page: ft.Page):
     landing = fwv.WebView(url=project_url, expand=True, visible=False) if page.web else None
     if page.web:
         header_view = fwv.WebView(url=f"{chrome_url}?vista=header&pagina=mapa", height=73)
-        footer_view = fwv.WebView(url=f"{chrome_url}?vista=footer", height=300)
-        root.expand = False
-        map_page = ft.Column([root, footer_view], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
-        page.add(header_view, map_page, landing)
+        page.add(header_view, root, landing)
     else:
         page.add(toolbar, root)
     page.on_resize = resize
@@ -994,18 +1072,22 @@ async def main(page: ft.Page):
             path = urlsplit(route or "").path.rstrip("/")
             show_landing = path not in {"/mapa", "/globo"} and not page.query.to_dict.get("punto")
             landing.visible = show_landing
-            header_view.visible = map_page.visible = not show_landing
+            header_view.visible = root.visible = not show_landing
             section = page.query.to_dict.get("seccion")
             if show_landing and section in {"video", "proyecto", "equipo"}:
                 landing.url = f"{project_url}#{section}"
             if path in {"/mapa", "/globo"}:
                 show_map()
             page.update()
-            if path == "/mapa" and page.query.to_dict.get("accion") == "ubicacion":
-                page.run_task(locate)
-            if path == "/mapa" and page.query.to_dict.get("accion") == "buscar":
+            action = page.query.to_dict.get("accion")
+            if path == "/mapa" and action == "ubicacion":
+                await locate()
+                return
+            if path == "/mapa" and action == "buscar":
                 open_search(None)
             await open_point_route(route)
+            if path == "/mapa" and action == "dibujar":
+                await draw_parcel(None)
 
         async def route_changed(event):
             await open_route(event.route)
