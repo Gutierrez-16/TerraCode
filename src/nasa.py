@@ -86,3 +86,25 @@ def dry_spell(values):
         longest = max(count, longest)
         previous = day
     return longest
+
+SOIL_METRICS = {
+    "GWETTOP": "Humedad relativa superficial del suelo",
+    "GWETROOT": "Humedad relativa de la zona radicular",
+}
+
+
+def soil(lat, lon, start, end):
+    return _fetch(
+        "https://power.larc.nasa.gov/api/temporal/daily/point",
+        (
+            ("latitude", round(lat, 4)),
+            ("longitude", round(lon, 4)),
+            ("community", "AG"),
+            ("parameters", ",".join(SOIL_METRICS)),
+            ("start", start.strftime("%Y%m%d")),
+            ("end", end.strftime("%Y%m%d")),
+            ("format", "JSON"),
+            ("time-standard", "UTC"),
+        ),
+        int(monotonic() // 900),
+    )

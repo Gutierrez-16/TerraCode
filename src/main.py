@@ -19,6 +19,9 @@ from globe_view import GlobeView
 from place_search import find_places, google_location, google_places, google_search_enabled
 from uuid import uuid4
 
+from ml import predictor
+from ml import rotation as rotation_ml
+
 MAP_START = (15, 0)
 MAP_START_ZOOM = 2
 PARCEL_ZOOM = 15
@@ -106,6 +109,17 @@ async def main(page: ft.Page):
         toast_job = asyncio.create_task(hide()) if dismiss else None
     climate = ft.Column([ft.Text("Selecciona una parcela para consultar NASA POWER.")])
     satellite = ft.Column([ft.Text("Selecciona una parcela para buscar escenas ECOSTRESS.")])
+    soil_panel = ft.Column([
+        ft.Text("Selecciona una parcela para analizar el suelo.")
+    ])
+    crop_panel = ft.Column([
+        ft.Text("Selecciona una parcela para evaluar cultivos.")
+    ])
+    rotation_panel = ft.Column(
+        controls=[
+            ft.Text("Selecciona una parcela para analizar rotaciones.")
+        ]
+    )
     lat = ft.TextField(label="Latitud", width=155)
     lon = ft.TextField(label="Longitud", width=155)
     end = ft.TextField(label="Hasta (AAAA-MM-DD)", value=str(date.today()), width=180)
@@ -383,6 +397,18 @@ async def main(page: ft.Page):
         marker.markers = [fm.Marker(coordinates=point, content=ft.Icon(ft.Icons.LOCATION_ON, color="#D55334", size=36))]
         climate.controls = [ft.ProgressBar(), ft.Text("Consultando NASA POWER…")]
         satellite.controls = [ft.Text("Abre ECOSTRESS para consultar las escenas de esta parcela.")]
+        soil_panel.controls = [
+            ft.ProgressBar(),
+            ft.Text("Consultando humedad del suelo...")
+        ]
+        crop_panel.controls = [
+            ft.ProgressBar(),
+            ft.Text("Evaluando cultivos con Machine Learning...")
+        ]
+        rotation_panel.controls = [
+            ft.ProgressBar(),
+            ft.Text("Analizando alternativas de rotación...")
+        ]
         page.update()
         async def focus():
             try:
@@ -420,10 +446,14 @@ async def main(page: ft.Page):
 
         scene_request = load_scenes
         async def load_climate():
-            # A second tap can replace this selection before starting network work.
             await asyncio.sleep(.22)
-            await asyncio.gather(focus(), update(climate, nasa.climate, climate_panel))
 
+            await asyncio.gather(
+                focus(),
+                update(climate, nasa.climate, climate_panel),
+                update(soil_panel, nasa.soil, render_soil),
+                update(crop_panel, predictor.compare, render_crop_scenarios),
+            )
         climate_job = asyncio.create_task(load_climate())
 
     def climate_panel(data):
@@ -512,6 +542,329 @@ async def main(page: ft.Page):
                          horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
                          padding=10, bgcolor="#EDF6F1", border_radius=12),
             day_slider, detail,
+        ]
+
+    def render_soil(data):
+        tiles = []
+
+        for code, label in nasa.SOIL_METRICS.items():
+            values = [
+                value
+                for _, value in nasa.daily(data, code)
+                if value is not None and 0 <= value <= 1
+            ]
+
+            value = (
+                f"{mean(values):.2f} / 1"
+                if values
+                else "Sin datos"
+            )
+
+            tiles.append(card(label, value))
+
+        return [
+            ft.Text(
+                "Análisis hídrico del suelo",
+                size=20,
+                weight=ft.FontWeight.BOLD,
+            ),
+            ft.Text("NASA POWER · Datos regionales"),
+            ft.ResponsiveRow(tiles),
+            ft.Text(
+                "Los valores representan humedad relativa "
+                "del suelo en una escala de 0 a 1.",
+                size=12,
+            ),
+        ]
+
+    def render_crops(data):
+
+                scenario = {
+                        "rainfed": "Secano",
+                        "irrigated_gravity": "Riego por gravedad",
+                        "irrigated_drip": "Riego por goteo",
+                    }.get(data["water_supply"], "Desconocido")
+
+                controls = [
+                    ft.Text(
+                        "Recomendaciones agrícolas",
+                        size=22,
+                        weight=ft.FontWeight.BOLD
+                    ),
+                    ft.Text(
+                        "TerraSprout AI · Random Forest",
+                        color="#17604A"
+                    ),
+                    ft.Text(
+                        f"Referencia histórica: 1981-2010 · {scenario}",
+                        size=12
+                    )
+                ]
+                
+
+                avocado = data.get("avocado_gaez_v5")
+
+                if avocado is not None:
+                    controls.append(
+                        ft.Container(
+                            bgcolor="#E4F2E9",
+                            padding=15,
+                            border_radius=12,
+                            content=ft.Column([
+                                ft.Text(
+                                    "Palta",
+                                    size=20,
+                                    weight=ft.FontWeight.BOLD
+                                ),
+                                ft.Text(
+                                    f"Índice de aptitud: {avocado:.2f}/100"
+                                    ),
+                                    ft.ProgressBar(
+                                        value=avocado / 100,
+                                        color="#17604A"
+                                    ),
+                                    ft.Text(
+                                        "FAO GAEZ V5 · 2001-2020",
+                                        size=12
+                                    ),
+                                    ft.Text(
+                                        "Referencia bajo riego y manejo intensivo",
+                                        size=11
+                                    )
+                                ])
+                            )
+                        )
+
+                for item in data["recommendations"]:
+    
+                    score = item["score"]
+    
+                    controls.append(
+                        ft.Container(
+                            bgcolor="#E4F2E9",
+                            padding=15,
+                            border_radius=12,
+                            content=ft.Column([
+                                ft.Text(
+                                    item["crop"],
+                                    size=20,
+                                    weight=ft.FontWeight.BOLD
+                                ),
+                                ft.Text(
+                                    f"Índice de aptitud: {score:.2f}/100"
+                                ),
+                                ft.ProgressBar(
+                                    value=score / 100,
+                                    color="#17604A",
+                                    bgcolor="#C9DFD1"
+                                )
+                            ])
+                        )
+                    )
+    
+                controls.append(
+                    ft.Text(
+                        "Estimación experimental. No garantiza "
+                        "el rendimiento ni el éxito de la cosecha.",
+                        size=12,
+                    )
+                )
+    
+                return controls
+
+    def render_crop_scenarios(data):
+
+        rotation_panel.controls = render_rotation_scenarios(data)
+
+        results = ft.Column(
+            controls=render_crops(data["rainfed"])
+        )
+
+        async def show_rainfed(e):
+            results.controls = render_crops(data["rainfed"])
+            page.update()
+
+        async def show_irrigated(e):
+            results.controls = render_crops(data["irrigated_gravity"])
+            page.update()
+
+        async def show_drip(e):
+            results.controls = render_crops(data["irrigated_drip"])
+            page.update()
+
+        return [
+            ft.Text(
+                "Sistema de suministro de agua",
+                weight=ft.FontWeight.BOLD,
+                size=16,
+            ),
+            ft.Row(
+                controls=[
+                    ft.TextButton(
+                        "Secano",
+                        on_click=show_rainfed,
+                    ),
+                    ft.TextButton(
+                        "Gravedad",
+                        on_click=show_irrigated,
+                    ),
+                    ft.TextButton(
+                        "Goteo",
+                        on_click=show_drip,
+                    ),
+                ],
+                wrap=True,
+            ),
+            ft.Divider(),
+            results,
+        ]
+
+    def render_rotation_scenarios(data):
+
+        results = ft.Column()
+
+        crop_selector = ft.Dropdown(
+            label="Cultivo anterior",
+            value="mze",
+            options=[
+                ft.DropdownOption(
+                    key=item["code"],
+                    text=item["crop"],
+                )
+                for item in sorted(
+                    data["rainfed"]["recommendations"],
+                    key=lambda item: item["crop"],
+                )
+            ],
+        )
+
+        water_selector = ft.Dropdown(
+            label="Sistema de suministro de agua",
+            value="rainfed",
+            options=[
+                ft.DropdownOption(
+                    key="rainfed",
+                    text="Secano",
+                ),
+                ft.DropdownOption(
+                    key="irrigated_gravity",
+                    text="Riego por gravedad",
+                ),
+                ft.DropdownOption(
+                    key="irrigated_drip",
+                    text="Riego por goteo",
+                ),
+            ],
+        )
+
+        def calculate():
+
+            result = rotation_ml.recommend_rotations(
+                data[water_selector.value],
+                previous_crop=crop_selector.value,
+            )
+            controls = [
+                ft.Text(
+                    result["message"],
+                    weight=ft.FontWeight.BOLD,
+                )
+            ]
+
+            if result["status"] == "insufficient":
+
+                controls.append(
+                    ft.Text(
+                        "No se recomienda iniciar una "
+                        "rotación bajo estas condiciones.",
+                        color="#B45309",
+                    )
+                )
+
+            for item in result["next_crops"]:
+
+                controls.append(
+                    ft.Container(
+                        bgcolor="#E4F2E9",
+                        padding=15,
+                        border_radius=12,
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    item["crop"],
+                                    size=18,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    f"Aptitud: {item['score']:.2f}/100"
+                                ),
+                                ft.Text(item["reason"]),
+                            ]
+                        ),
+                    )
+                )
+
+            if result["plans"]:
+
+                controls.append(
+                    ft.Text(
+                        "Secuencias propuestas",
+                        size=18,
+                        weight=ft.FontWeight.BOLD,
+                    )
+                )
+
+            for plan in result["plans"]:
+
+                controls.append(
+                    ft.Container(
+                        bgcolor="#E4F2E9",
+                        padding=15,
+                        border_radius=12,
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    " → ".join(plan["crops"]),
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    f"Aptitud mínima: "
+                                    f"{plan['minimum_suitability']:.2f}/100"
+                                ),
+                            ]
+                        ),
+                    )
+                )
+
+            results.controls = controls
+
+        async def analyze(e):
+            calculate()
+            page.update()
+
+        crop_selector.on_select = analyze
+        water_selector.on_select = analyze
+
+        calculate()
+
+        return [
+            ft.Text(
+                "Planificador de rotación agrícola",
+                size=22,
+                weight=ft.FontWeight.BOLD,
+            ),
+            ft.Text(
+                "TerraSprout AI · Machine Learning y agronomía",
+                color="#17604A",
+            ),
+            crop_selector,
+            water_selector,
+            ft.Divider(),
+            results,
+            ft.Text(
+                "Propuesta experimental. Requiere validar "
+                "el calendario agrícola y la disponibilidad de agua.",
+                size=11,
+            ),
         ]
 
     def scene_panel(entries):
@@ -730,7 +1083,14 @@ async def main(page: ft.Page):
         button("Dibujar o editar parcela", draw_parcel),
         ft.Text("Clima y ECOSTRESS se consultan para el punto seleccionado."),
     ])
-    panels = {"Clima": climate, "ECOSTRESS": satellite, "Parcela": parcel, "Rotaciones": rotation}
+    panels = {
+        "Clima": climate,
+        "Suelo": soil_panel,
+        "ECOSTRESS": satellite,
+        "Parcela": parcel,
+        "Cultivos": crop_panel,
+        "Rotaciones": rotation_panel,
+    }
     panel = ft.Container(content=climate, bgcolor="#FFFFFF", padding=18, border_radius=16)
 
     def highlight_tab(name):
